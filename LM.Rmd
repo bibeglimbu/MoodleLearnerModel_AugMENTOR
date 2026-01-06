@@ -1,0 +1,293 @@
+---
+title: "R Notebook"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+```{r setup, include=FALSE}
+# 1. Define the list of packages you need
+pkgs <- c("tidyverse", "readxl", "ggplot2", "readr", "dplyr", "janitor","lubridate")
+
+# 2. Check if they are installed; if not, install them
+install_if_missing <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+if (length(install_if_missing)) install.packages(install_if_missing)
+
+# This chunk won't appear in your final report, but it loads everything
+library(tidyverse)
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(janitor)
+library(lubridate)
+
+# Optional: Set global options (e.g., hide all code warnings)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load the data in a dataframe
+```{r}
+# This tells R: "Look in the 'data' folder, then find the CSV"
+df <- read.csv("data/Composite_data_W1.csv", na = c("", "n/a", "N/A"))
+
+# 2. Keep everything from the first column up to "efficiency"
+df_clean <- df %>% 
+  select(1:efficiency)%>%
+  clean_names()
+
+# Check the result
+colnames(df_clean)
+```
+## Calculate Motivation or Engagement with SelfDetermination Theory
+
+Follows methodology in [Cristea et al.](https://doi.org/10.1007/s11257-023-09374-x) which quantifies engagement/motivation according to the Self-Determination theory (SDT). Defines a `max_norm()` function to do 'Max Normalisation' as the methodlogy uses normalisation for standarisation of behavorial indicators.
+
+```{r}
+
+# --- helper functions ---
+max_norm <- function(x) {
+  #finds the highest number in the column. Ignore empty (NA) cells
+  m <- suppressWarnings(max(x, na.rm = TRUE)) 
+  #returns a column of zeros, if it fails
+  if (!is.finite(m) || m <= 0) return(rep(0, length(x))) 
+  #divide every entry in the column by the maximum value
+  x / m
+}
+
+```
+
+`nomralise_var()` creates a  Normalised score, by help of `max_norm()`, from a list of raw data and attaches it to the data frame. 
+
+```{r}
+nomralise_var <- function(df, vars, prefix, norm_func = max_norm) {
+  #identify which columns are missing from raw data
+  present <- intersect(vars, names(df))
+  missing <- setdiff(vars, names(df))
+
+  #list the missing columns from raw data
+  message(prefix, " - missing vars: ",
+          if (length(missing) == 0) "None" else paste(missing, collapse = ", "))
+
+  #if none of the variables were found, exit
+  if (length(present) == 0) {
+    df[[prefix]] <- NA_real_
+    return(list(df = df, used = character(0), missing = missing))
+  }
+
+  # create normalized indicator columns
+  norm_cols <- paste0(prefix, "_", present, "_norm")
+  for (i in seq_along(present)) {
+    v <- present[i]
+    df[[norm_cols[i]]] <- norm_func(df[[v]])
+  }
+
+  # construct = mean of normalized indicators
+  df[[prefix]] <- rowMeans(df[, norm_cols, drop = FALSE], na.rm = TRUE)
+
+  list(df = df, used = present, missing = missing, norm_cols = norm_cols)
+}
+
+```
+
+### Autonomy
+Calculates Autonomy component. [Cristea et al.](https://doi.org/10.1007/s11257-023-09374-x) only uses discrete (counting) data based behavioral indicators for general availability and applicability, for example number of clicks, number of visits, etc. `aut_vars` holds the variable to be used to calculate autonmy component. Ensure the name matches the ones in `df_clean`. 
+
+Here, the following two indicators are used as prescribed by [Cristea et al.](https://doi.org/10.1007/s11257-023-09374-x)
+
+* `no_attemptstoanswer_w1`: is the number of attempts a student makes to answer any questions during the week
+* `no_resources_accessed`: is the number of views made by a student in all the learning content in this week
+
+```{r}
+aut_vars <- c("no_attemptstoanswer_w1", "no_resources_accessed")
+
+res_aut <- nomralise_var(df_clean, aut_vars, prefix = "Aut")
+df_clean <- res_aut$df
+view(df_clean)
+```
+
+### Competence
+Calculate competence similarly to Autonomy. `com_vars` holds the variable to be used to calculate competence component. Ensure the name matches the ones in `df_clean`.
+
+Here, the following two indicators are used as prescribed by [Cristea et al.](https://doi.org/10.1007/s11257-023-09374-x)
+
+* `no_revisits_b4quiz_w1`: is the number of revisits (after the first exposure) a student makes in all learning content (except quizzes)
+* `no_analytics_viewed`: is the number of times an analytics page was viewed by a student
+
+```{r}
+
+com_vars <- c("no_revisits_b4quiz_w1", "no_analytics_viewed")
+res_com <- nomralise_var(df_clean, com_vars, prefix = "Comp")
+df_clean <- res_com$df
+view(df_clean)
+```
+
+No **Relatedness** is calculated in this context as there was no relevant indicators. Cristea mostly uses social, collaborative indicators from forums etc. but in this context no such data was available.
+
+## Calculate intial Memory Strength
+Below, we will implement the learner model by first calculating the weights for each construct/indicator (how much each indicator impacts intial strength of memory)
+
+### Fit a model to determine the with of each indicators 
+The weight for each construct of the learner model is determined for the week using fractional regression which enables output between 0-1, which will later be used to calculate the intial strength
+```{r}
+df_weights <- df_clean %>%
+  mutate(
+    zAut    = as.numeric(scale(Aut)), #standarises these with zscores
+    zComp   = as.numeric(scale(Comp)),
+    zEffort = as.numeric(scale(effort_proxy)), #even though effort_proxy is already a zscore, decided to do it again for consistency
+    quiz_prop = quiz01_score / 3, #bound the value to 0-1 for use in strength calculation
+  )  %>%
+  mutate(
+    # keep away from exact 0/1 for logit stability
+    quiz_prop = pmin(1 - 1e-6, pmax(1e-6, quiz_prop))
+  )
+
+#fractional logit glm: logit link guarantees the probability/strength of memory between [0,1] 
+m_init <- glm(
+  quiz_prop ~ zAut + zComp + zEffort,
+  data = df_weights,
+  family = quasibinomial(link = "logit")
+)
+
+summary(m_init)
+
+```
+
+## Calculate intial memory strength for each student
+Memory Strength score for students based on the model above.
+
+```{r}
+
+df_weights <- df_weights %>%
+  mutate(S0 = predict(m_init, newdata = ., type = "response"))
+view(df_weights)
+
+```
+
+## Decay
+Load the log file
+
+```{r}
+#The date of the final exam
+finalexam_cutoff <- ymd_hm("2020-12-16 00:00", tz = "Europe/Berlin")
+
+#import the raw log file and clean it
+df_log_w1 <- read_csv("data/log_data_W1.csv", na = c("", "n/a", "N/A")) %>%
+  clean_names() %>%
+  mutate(
+    student_id = as.character(student_id),
+    timestamp  = dmy_hm(time_sort, tz = "Europe/Berlin"),
+    component  = tolower(component),
+    event_name = tolower(event_name)
+  ) %>%
+  filter(!is.na(timestamp), timestamp < finalexam_cutoff) %>% #Remove any rows where the date or time is missing or incorrectly formatted
+  filter(component %in% c("url", "file", "quiz")) #Remove any activity that happened after the exam started.
+
+colnames(df_log_w1) #Check the names
+
+#append the W1 quiz time stamp to the log for futher calculations
+df_joined <- df_log_w1 %>%
+  left_join(df_clean %>% select(student_id, time_w1_quizz), by = "student_id") %>%
+  filter(!is.na(timestamp), !is.na(time_w1_quizz)) %>%
+  filter(timestamp > time_w1_quizz, timestamp < finalexam_cutoff)
+
+view(df_joined)
+```
+
+### Define revision study sessions
+We mark each revisit of Week-1 materials and quiz after the first instance of Week1 quiz, defined by the event "Quiz attempt Submitted" and before the final exam which was held in 2020-12-16. Logs entries within `session_gap_mins` mintues of each other will be considered one learning session
+
+```{r}
+quiz_review_events <- tolower(c(
+  "Quiz attempt reviewed",
+  "Quiz attempt viewed",
+  "Quiz attempt summary viewed",
+  "Course module viewed"
+))
+
+# keep only “review” events
+df_review_events <- df_joined %>%
+  filter(
+    component %in% c("url", "file") |
+      (component == "quiz" & event_name %in% quiz_review_events)
+  ) %>%
+  arrange(student_id, timestamp) %>%
+  mutate(
+    # classify review type
+    review_type = if_else(component == "quiz", "quiz", "resource")
+  )
+
+#if a day has passed since last visit, create a new session
+session_gap_mins <- 1440
+
+review_sessions <- df_review_events %>%
+  group_by(student_id) %>%
+  arrange(timestamp) %>%
+  mutate(
+    #Calculate the delta between the current row and the row immediately before it
+    gap_mins = as.numeric(difftime(timestamp, lag(timestamp), units = "mins")),
+    new_session = if_else(is.na(gap_mins) | gap_mins > session_gap_mins, 1L, 0L),
+    session_id = cumsum(new_session)
+  ) %>%
+  group_by(student_id, session_id) %>%
+  summarise(
+    session_time = min(timestamp),
+    # if any quiz review happened in the session, treat session as “quiz”, otherwise resource
+    session_type = if_else(any(review_type == "quiz"), "quiz", "resource"),
+    .groups = "drop"
+  )
+
+view(review_sessions)
+
+```
+
+
+### Decay
+
+```{r}
+half_life_days <- 14 #assumes half of learnt info is forgotten in 14 days
+lambda <- log(2) / half_life_days #decay Constant
+exam_day <- as_date(finalexam_cutoff)
+
+#create a new table called review_feats with one row per student
+review_feats <- review_days %>%
+  group_by(student_id) %>%
+  summarise(
+    n_review_days = n(), #total unique days the student studied
+    last_review_day = max(day), #last day the student logged in to review
+    days_since_last_review = as.numeric(exam_day - last_review_day),
+    #Ebbinghaus Forgetting Curve
+    review_strength = sum(exp(-lambda * as.numeric(exam_day - day))),
+    .groups = "drop" 
+  )
+
+```
+
+Combine prior knowledge and decay and reviews to one "retention at exam"
+
+```{r}
+gamma <- 1  # weight of review vs quiz baseline; tune later
+
+df_clean <- df_clean %>%
+  mutate(
+    quiz_day = as_date(time_w1_quizz),
+    days_quiz_to_exam = as.numeric(exam_day - quiz_day),
+    prior_decay = quiz01_score * exp(-lambda * days_quiz_to_exam)
+  ) %>%
+  left_join(review_feats, by = "student_id") %>%
+  mutate(
+    n_review_days = replace_na(n_review_days, 0),
+    review_strength = replace_na(review_strength, 0),
+    retention_w1 = prior_decay + gamma * review_strength,
+    retention_w1_z = as.numeric(scale(retention_w1))
+  )
+
+```
+
+
+
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
