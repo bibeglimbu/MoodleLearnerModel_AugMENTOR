@@ -1,15 +1,15 @@
 ---
-title: "R Notebook"
+title: "AugMentor Learner Model"
 output:
-  html_notebook: default
   pdf_document: default
+  html_notebook: default
 ---
 
 This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
 
 ```{r setup, include=FALSE}
 # 1. Define the list of packages you need
-pkgs <- c("tidyverse", "readxl", "ggplot2", "readr", "dplyr", "janitor","lubridate")
+pkgs <- c("tidyverse", "readxl", "ggplot2", "readr", "dplyr", "janitor","lubridate","purrr")
 
 # 2. Check if they are installed; if not, install them
 install_if_missing <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
@@ -22,6 +22,7 @@ library(readr)
 library(dplyr)
 library(janitor)
 library(lubridate)
+library(purrr)
 
 # Optional: Set global options (e.g., hide all code warnings)
 knitr::opts_chunk$set(warning = FALSE, message = FALSE)
@@ -34,7 +35,7 @@ df <- read.csv("data/Composite_data_W1.csv", na = c("", "n/a", "N/A"))
 
 # 2. Keep everything from the first column up to "efficiency"
 df_clean <- df %>% 
-  select(1:efficiency)%>%
+  select(1:Final_Score)%>%
   clean_names()
 
 # Check the result
@@ -125,7 +126,7 @@ view(df_clean)
 
 No **Relatedness** is calculated in this context as there was no relevant indicators. Cristea mostly uses social, collaborative indicators from forums etc. but in this context no such data was available.
 
-## Calculate intial Memory Strength
+## Calculate initial Memory Strength
 Below, we will implement the learner model by first calculating the weights for each construct/indicator (how much each indicator impacts intial strength of memory)
 
 ### Fit a model to determine the with of each indicators 
@@ -154,7 +155,7 @@ summary(m_init)
 
 ```
 
-## Calculate intial memory strength for each student
+### Calculate initial memory strength for each student
 Memory Strength score for students based on the model above.
 
 ```{r}
@@ -165,8 +166,8 @@ view(df_weights)
 
 ```
 
-## Decay
-Load the log file
+## Calculate Decay
+Load the log file and filter events that fall between the first weekly exam and the final exam.
 
 ```{r}
 #The date of the final exam
@@ -196,7 +197,7 @@ view(df_joined)
 ```
 
 ### Define revision study sessions
-We mark each revisit of Week-1 materials and quiz after the first instance of Week1 quiz, defined by the event "Quiz attempt Submitted" and before the final exam which was held in 2020-12-16. Logs entries within `session_gap_mins` mintues of each other will be considered one learning session
+We mark each revisit of Week-1 materials and quiz after the first instance of Week1 quiz, defined by the event "Quiz attempt Submitted" and before the final exam which was held in 2020-12-16. Logs entries within `session_gap_mins` minutes of each other will be considered one learning session
 
 ```{r}
 quiz_review_events <- tolower(c(
@@ -245,47 +246,172 @@ view(review_sessions)
 
 ### Decay
 
-```{r}
-half_life_days <- 14 #assumes half of learnt info is forgotten in 14 days
-lambda <- log(2) / half_life_days #decay Constant
-exam_day <- as_date(finalexam_cutoff)
-
-#create a new table called review_feats with one row per student
-review_feats <- review_days %>%
-  group_by(student_id) %>%
-  summarise(
-    n_review_days = n(), #total unique days the student studied
-    last_review_day = max(day), #last day the student logged in to review
-    days_since_last_review = as.numeric(exam_day - last_review_day),
-    #Ebbinghaus Forgetting Curve
-    review_strength = sum(exp(-lambda * as.numeric(exam_day - day))),
-    .groups = "drop" 
-  )
-
-```
-
-Combine prior knowledge and decay and reviews to one "retention at exam"
+calculates strength of memory at the final exam based on explonential decay. Takes into consideration the time difference and number of revision
 
 ```{r}
-gamma <- 1  # weight of review vs quiz baseline; tune later
+#parameters (tune later)
+HL_days <- 7          # half-life in days: strength halves every HL_days if no review
+#as a introductory topic or relatively simple materials i have chosen to provide a high strenghening
+b_quiz  <- 0.1       # boost after a quiz-type session
+b_res   <- 0.1       # boost after a resource-type session, however, since students were not allowed to retake quizzes they are both same
+eps     <- 1e-6       # clamp to avoid exact 0/1
+exam_time <- finalexam_cutoff 
 
-df_clean <- df_clean %>%
-  mutate(
-    quiz_day = as_date(time_w1_quizz),
-    days_quiz_to_exam = as.numeric(exam_day - quiz_day),
-    prior_decay = quiz01_score * exp(-lambda * days_quiz_to_exam)
+#simulator: returns strength at each revision
+simulate_student <- function(student_id, quiz_time, S0, review_sessions, exam_time) {
+
+  # clamp initial: ensures value is between 0-1
+  S <- pmin(1 - eps, pmax(eps, S0))
+  last_t <- quiz_time
+
+  sess <- review_sessions %>%
+    filter(student_id == !!student_id,
+           session_time > quiz_time,
+           session_time < exam_time) %>%
+    arrange(session_time)
+
+  out <- tibble()
+
+  if (nrow(sess) > 0) {
+    for (i in seq_len(nrow(sess))) {
+      t_i <- sess$session_time[i]
+      dt_days <- as.numeric(difftime(t_i, last_t, units = "days")) #the time gap since the study session
+
+      # forgetting (exponential decay)
+      S_before <- S * exp(-log(2) * dt_days / HL_days)
+
+      # review boost to memory strength (saturating so it never exceeds 1)
+      b <- if (sess$session_type[i] == "quiz") b_quiz else b_res
+      S_after <- S_before + b * (1 - S_before) 
+
+      out <- bind_rows(out, tibble(
+        student_id      = student_id,
+        revision_index  = i,
+        revision_time   = t_i,
+        gap_days        = dt_days,
+        revision_type   = sess$session_type[i],
+        strength_before = S_before,
+        strength_after  = S_after
+      ))
+
+      S <- S_after
+      last_t <- t_i
+    }
+  }
+
+  # decay to exam
+  dt_exam <- as.numeric(difftime(exam_time, last_t, units = "days"))
+  S_exam <- S * exp(-log(2) * dt_exam / HL_days)
+
+  out <- bind_rows(out, tibble(
+    student_id      = student_id,
+    revision_index  = ifelse(nrow(out) == 0, 0, max(out$revision_index) + 1),
+    revision_time   = exam_time,
+    gap_days        = dt_exam,
+    revision_type   = "exam",
+    strength_before = S_exam,
+    strength_after  = S_exam
+  ))
+
+  out
+}
+
+# run for all students
+df_base <- df_weights %>%
+  transmute(
+    student_id = as.character(student_id),
+    quiz_time  = dmy_hm(time_w1_quizz, tz = "Europe/Berlin"),
+    S0         = S0
   ) %>%
-  left_join(review_feats, by = "student_id") %>%
-  mutate(
-    n_review_days = replace_na(n_review_days, 0),
-    review_strength = replace_na(review_strength, 0),
-    retention_w1 = prior_decay + gamma * review_strength,
-    retention_w1_z = as.numeric(scale(retention_w1))
-  )
+  filter(!is.na(quiz_time), !is.na(S0))
+
+strength_timeline <- purrr::pmap_dfr(
+  list(df_base$student_id, df_base$quiz_time, df_base$S0),
+  ~simulate_student(..1, ..2, ..3, review_sessions, exam_time)
+)
+
+# retention at final exam (one row per student)
+retention_at_exam <- strength_timeline %>%
+  filter(revision_type == "exam") %>%
+  transmute(student_id, S_exam = strength_after)
+
+print(retention_at_exam, n = Inf)
 
 ```
 
+### Compare the prediction aginst the observed grades
+Takes the predicted memory strength `S_exam`for each student and compare it to their actual exam scores to judge accuracy
 
+```{r}
+# Pull the observed final exam score (adjust the column name if yours differs)
+observed_final <- df_clean %>%
+  transmute(
+    student_id = as.character(student_id),
+    Final_Score = final_score
+  ) %>%
+  filter(!is.na(Final_Score))
+
+# Join predictions (S_exam: strength at final exam) with observed finals
+eval_df <- retention_at_exam %>%
+  left_join(observed_final, by = "student_id") %>%
+  filter(!is.na(Final_Score))
+
+print(eval_df, n = Inf)
+
+# how well S_exam ranks students vs Final_Score
+# measures the strength and direction between two ranked variables
+spearman_rho <- cor(eval_df$S_exam, eval_df$Final_Score, method = "spearman")
+
+# measures the strength and direction of a linear relationship between two continuous variable
+pearson_r    <- cor(eval_df$S_exam, eval_df$Final_Score, method = "pearson")
+
+cat("Spearman rho:", spearman_rho, "\n") 
+cat("Pearson r:", pearson_r, "\n")
+
+# Error metrics (need both on comparable scales)
+eval_df <- eval_df %>%
+  mutate(
+    Final_01 = (Final_Score - min(Final_Score)) / (max(Final_Score) - min(Final_Score)) # Normalize Final_Score
+  )
+
+mae  <- mean(abs(eval_df$S_exam - eval_df$Final_01))
+rmse <- sqrt(mean((eval_df$S_exam - eval_df$Final_01)^2))
+
+#keeps predictions within 0..4
+eval_df <- eval_df %>%
+  mutate(Final_01 = Final_Score / 4)
+
+calib <- glm(Final_01 ~ S_exam, data = eval_df,
+             family = quasibinomial(link = "logit"))
+print(summary(calib))
+
+# predicted grade (0..4)
+eval_df <- eval_df %>%
+  mutate(Final_hat_01 = predict(calib, type = "response"),
+         Final_hat = 4 * Final_hat_01)
+
+# error on grade scale (0..4)
+mae_grade  <- mean(abs(eval_df$Final_hat - eval_df$Final_Score))
+rmse_grade <- sqrt(mean((eval_df$Final_hat - eval_df$Final_Score)^2))
+
+
+cat("MAE on grade scale:", mae_grade, "\n") #calculates mean absolute error
+cat("RMSE on grade scale:", rmse_grade, "\n") #calculates root mean squared error
+
+
+```
+
+### Draw the plot
+Fitted model vs actual grades
+
+```{r}
+# Plot
+ggplot(eval_df, aes(x = S_exam, y = Final_Score)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Predicted retention at exam (S_exam)", y = "Observed Final_Score")
+
+```
 
 
 When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
