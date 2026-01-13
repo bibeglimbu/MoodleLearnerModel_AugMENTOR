@@ -371,11 +371,14 @@ cat("Pearson r:", pearson_r, "\n")
 # Error metrics (need both on comparable scales)
 eval_df <- eval_df %>%
   mutate(
-    Final_01 = (Final_Score - min(Final_Score)) / (max(Final_Score) - min(Final_Score)) # Normalize Final_Score
+    Final_minmax = (Final_Score - min(Final_Score)) / (max(Final_Score) - min(Final_Score)) # Normalize Final_Score
   )
 
-mae  <- mean(abs(eval_df$S_exam - eval_df$Final_01))
-rmse <- sqrt(mean((eval_df$S_exam - eval_df$Final_01)^2))
+mae  <- mean(abs(eval_df$S_exam - eval_df$Final_minmax))
+rmse <- sqrt(mean((eval_df$S_exam - eval_df$Final_minmax)^2))
+
+cat("MAE pre on grade scale:", mae, "\n") #calculates mean absolute error
+cat("RMSE pre on grade scale:", rmse, "\n") #calculates root mean squared error
 
 #keeps predictions within 0..4
 eval_df <- eval_df %>%
@@ -411,6 +414,10 @@ ggplot(eval_df, aes(x = S_exam, y = Final_Score)) +
   geom_smooth(method = "lm", se = FALSE) +
   labs(x = "Predicted retention at exam (S_exam)", y = "Observed Final_Score")
 
+```
+### Check whats driving the drop
+```{r}
+mean(eval_df$Final_Score - 4*eval_df$S_exam)
 ```
 
 
